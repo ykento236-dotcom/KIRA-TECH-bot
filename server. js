@@ -1,0 +1,518 @@
+// ============================================================
+//  KIRA TECH BOT 🌹 - WhatsApp + Telegram (Pairing Code)
+//  Auteur : Mr KIRA_TECH
+//  Version : 1.0.0
+//  Stockage des credentials : MongoDB Atlas (recommandé)
+//  Toutes les autres clés API sont optionnelles.
+// ============================================================
+
+require('dotenv').config();
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const Pino = require('pino');
+const { Telegraf } = require('telegraf');
+const express = require('express');
+const axios = require('axios');
+const ytdl = require('ytdl-core');
+const translate = require('google-translate-api-x');
+const gTTS = require('gtts');
+const OpenAI = require('openai');
+const fs = require('fs-extra');
+const { MongoClient } = require('mongodb');
+const fetch = require('node-fetch');
+
+// ============================================================
+//  CONFIGURATION
+// ============================================================
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+if (!TELEGRAM_TOKEN) {
+    console.error('❌ ERREUR : TELEGRAM_TOKEN manquant. Le bot ne peut pas démarrer.');
+    process.exit(1);
+}
+
+const PREFIX = '.';
+const WELCOME_IMAGE_URL = 'https://i.ibb.co/hJqtxPrb/52-C1-EBD9-25-DC-44-E8-894-E-BE9755-E9-CB2-A.jpg';
+const CHANNEL_WA = 'https://whatsapp.com/channel/0029Vb7WJzp84OmBD0fEEJ2X';
+const CHANNEL_TG = 'https://t.me/+mQ3aQpCsEqI0YmY0';
+
+let sock = null;
+let isWhatsAppReady = false;
+let botOwnerNumber = '';
+let sudoList = [];
+let groupSettings = {};
+let chatStates = {};
+let pairingCodeCache = null;
+
+const logger = Pino({ level: 'info' });
+const tgBot = new Telegraf(TELEGRAM_TOKEN);
+
+// ============================================================
+//  MONGODB POUR STOCKER LES CREDENTIALS (persistant)
+// ============================================================
+let mongoClient = null;
+let credsCollection = null;
+
+async function connectMongo() {
+    if (!process.env.MONGODB_URI) {
+        console.warn('⚠️ MONGODB_URI non défini, les sessions ne seront pas persistantes.');
+        return;
+    }
+    try {
+        mongoClient = new MongoClient(process.env.MONGODB_URI);
+        await mongoClient.connect();
+        const db = mongoClient.db('whatsapp_bot');
+        credsCollection = db.collection('creds');
+        console.log('✅ MongoDB connecté.');
+    } catch (e) {
+        console.error('❌ Erreur MongoDB:', e);
+    }
+}
+
+async function getCreds() {
+    if (!credsCollection) return null;
+    const doc = await credsCollection.findOne({ _id: 'creds' });
+    return doc ? doc.data : null;
+}
+
+async function saveCreds(data) {
+    if (!credsCollection) return;
+    await credsCollection.updateOne(
+        { _id: 'creds' },
+        { $set: { data: data } },
+        { upsert: true }
+    );
+}
+
+// ============================================================
+//  FONCTIONS UTILITAIRES
+// ============================================================
+function formatNumber(num) {
+    return num.replace(/[^0-9]/g, '');
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function streamToBuffer(stream) {
+    const chunks = [];
+    for await (const chunk of stream) {
+        chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+}
+
+async function sendText(jid, text) {
+    if (!sock) return;
+    try {
+        await sock.sendMessage(jid, { text });
+    } catch (e) {
+        console.error('Erreur sendText:', e);
+    }
+}
+
+async function sendTextWithMentions(jid, text, mentions) {
+    if (!sock) return;
+    try {
+        await sock.sendMessage(jid, { text, mentions });
+    } catch (e) {
+        console.error('Erreur sendTextWithMentions:', e);
+    }
+}
+
+// ============================================================
+//  ADMIN / OWNER
+// ============================================================
+async function isAdmin(jid, userId) {
+    try {
+        const meta = await sock.groupMetadata(jid);
+        const participant = meta.participants.find(p => p.id === userId);
+        return participant && (participant.admin === 'admin' || participant.admin === 'superadmin');
+    } catch (e) {
+        return false;
+    }
+}
+
+function isOwner(userId) {
+    return userId === botOwnerNumber + '@s.whatsapp.net' || sudoList.includes(userId);
+}
+
+// ============================================================
+//  PARAMÈTRES GROUPES (stockage fichier, pas critique)
+// ============================================================
+const SETTINGS_FILE = './groupSettings.json';
+
+async function loadSettings() {
+    try {
+        if (fs.existsSync(SETTINGS_FILE)) {
+            groupSettings = await fs.readJson(SETTINGS_FILE);
+        }
+    } catch (e) {
+        groupSettings = {};
+    }
+}
+
+async function saveSettings() {
+    await fs.writeJson(SETTINGS_FILE, groupSettings, { spaces: 2 });
+}
+
+// ============================================================
+//  COMMANDES WHATSAPP (100+ commandes)
+// ============================================================
+const commands = {};
+
+// -------- GROUPE --------
+commands.add = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    if (!args[0]) return sendText(from, '❗ Utilisation : .add <numéro>');
+    const num = formatNumber(args[0]) + '@s.whatsapp.net';
+    try {
+        await sock.groupParticipantsUpdate(from, [num], 'add');
+        sendText(from, `✅ ${args[0]} ajouté.`);
+    } catch (e) {
+        sendText(from, `❌ Erreur : ${e.message}`);
+    }
+};
+
+commands.kick = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const mention = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+    const target = mention || (args[0] ? formatNumber(args[0]) + '@s.whatsapp.net' : null);
+    if (!target) return sendText(from, '❗ Mentionnez ou donnez le numéro.');
+    try {
+        await sock.groupParticipantsUpdate(from, [target], 'remove');
+        sendText(from, `✅ Utilisateur expulsé.`);
+    } catch (e) {
+        sendText(from, `❌ Erreur : ${e.message}`);
+    }
+};
+
+commands.promote = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const mention = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+    const target = mention || (args[0] ? formatNumber(args[0]) + '@s.whatsapp.net' : null);
+    if (!target) return sendText(from, '❗ Mentionnez ou donnez le numéro.');
+    try {
+        await sock.groupParticipantsUpdate(from, [target], 'promote');
+        sendText(from, `✅ Utilisateur promu admin.`);
+    } catch (e) {
+        sendText(from, `❌ Erreur : ${e.message}`);
+    }
+};
+
+commands.demote = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const mention = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+    const target = mention || (args[0] ? formatNumber(args[0]) + '@s.whatsapp.net' : null);
+    if (!target) return sendText(from, '❗ Mentionnez ou donnez le numéro.');
+    try {
+        await sock.groupParticipantsUpdate(from, [target], 'demote');
+        sendText(from, `✅ Admin rétrogradé.`);
+    } catch (e) {
+        sendText(from, `❌ Erreur : ${e.message}`);
+    }
+};
+
+commands.tag = async (msg, args, from, sender) => {
+    const text = args.join(' ') || '';
+    const mentions = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    if (mentions.length === 0) return sendText(from, '❗ Mentionnez au moins une personne.');
+    sendTextWithMentions(from, text, mentions);
+};
+
+commands.tagall = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const meta = await sock.groupMetadata(from);
+    const participants = meta.participants.map(p => p.id);
+    const text = args.join(' ') || '📢 Message à tous :';
+    sendTextWithMentions(from, text, participants);
+};
+
+commands.mute = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    if (!groupSettings[from]) groupSettings[from] = {};
+    groupSettings[from].mute = true;
+    await saveSettings();
+    sendText(from, `🔇 Groupe muet.`);
+};
+
+commands.unmute = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    if (!groupSettings[from]) groupSettings[from] = {};
+    groupSettings[from].mute = false;
+    await saveSettings();
+    sendText(from, `🔊 Groupe réactivé.`);
+};
+
+commands.welcome = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const text = args.join(' ') || 'Bienvenue @user !';
+    if (!groupSettings[from]) groupSettings[from] = {};
+    groupSettings[from].welcomeMsg = text;
+    await saveSettings();
+    sendText(from, `✅ Message de bienvenue mis à jour.`);
+};
+
+commands.goodbye = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const text = args.join(' ') || 'Au revoir @user !';
+    if (!groupSettings[from]) groupSettings[from] = {};
+    groupSettings[from].goodbyeMsg = text;
+    await saveSettings();
+    sendText(from, `✅ Message de départ mis à jour.`);
+};
+
+commands.link = async (msg, args, from, sender) => {
+    try {
+        const code = await sock.groupInviteCode(from);
+        sendText(from, `🔗 Lien : https://chat.whatsapp.com/${code}`);
+    } catch (e) {
+        sendText(from, `❌ Impossible d'obtenir le lien.`);
+    }
+};
+
+commands.resetlink = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    try {
+        await sock.groupRevokeInvite(from);
+        const code = await sock.groupInviteCode(from);
+        sendText(from, `✅ Nouveau lien : https://chat.whatsapp.com/${code}`);
+    } catch (e) {
+        sendText(from, `❌ Erreur : ${e.message}`);
+    }
+};
+
+commands.groupinfo = async (msg, args, from, sender) => {
+    try {
+        const meta = await sock.groupMetadata(from);
+        const admins = meta.participants.filter(p => p.admin).map(p => p.id.split('@')[0]).join(', ');
+        const info = `📋 *Infos groupe*\n📛 ${meta.subject}\n📝 ${meta.desc || 'Aucune'}\n👥 ${meta.participants.length}\n🛡️ Admins : ${admins}`;
+        sendText(from, info);
+    } catch (e) {
+        sendText(from, `❌ Erreur : ${e.message}`);
+    }
+};
+
+commands.listadmin = async (msg, args, from, sender) => {
+    try {
+        const meta = await sock.groupMetadata(from);
+        const admins = meta.participants.filter(p => p.admin).map(p => p.id.split('@')[0]).join(', ');
+        sendText(from, `👑 Admins : ${admins}`);
+    } catch (e) {
+        sendText(from, `❌ Erreur : ${e.message}`);
+    }
+};
+
+commands.groupname = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const name = args.join(' ');
+    if (!name) return sendText(from, '❗ Spécifiez un nom.');
+    try {
+        await sock.groupUpdateSubject(from, name);
+        sendText(from, `✅ Nom mis à jour.`);
+    } catch (e) {
+        sendText(from, `❌ Erreur : ${e.message}`);
+    }
+};
+
+commands.setgdesc = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const desc = args.join(' ');
+    if (!desc) return sendText(from, '❗ Spécifiez une description.');
+    try {
+        await sock.groupUpdateDescription(from, desc);
+        sendText(from, `✅ Description mise à jour.`);
+    } catch (e) {
+        sendText(from, `❌ Erreur : ${e.message}`);
+    }
+};
+
+commands.ppgroup = async (msg, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+    let imageBuffer = null;
+    if (quoted?.imageMessage) {
+        const stream = await sock.downloadMediaMessage(quoted);
+        imageBuffer = await streamToBuffer(stream);
+    } else if (msg.message?.imageMessage) {
+        const stream = await sock.downloadMediaMessage(msg);
+        imageBuffer = await streamToBuffer(stream);
+    }
+    if (!imageBuffer) return sendText(from, '❗ Envoyez ou répondez à une image.');
+    try {
+        await sock.updateProfilePicture(from, imageBuffer);
+        sendText(from, `✅ Photo de profil mise à jour.`);
+    } catch (e) {
+        sendText(from, `❌ Erreur : ${e.message}`);
+    }
+};
+
+commands.staff = async (msg, args, from, sender) => {
+    const text = `👥 *Staff*\n👑 Owner : ${botOwnerNumber || 'Non défini'}\n🛡️ Sudo : ${sudoList.join(', ') || 'Aucun'}`;
+    sendText(from, text);
+};
+
+commands.antilink = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const state = args[0]?.toLowerCase();
+    if (state !== 'on' && state !== 'off') return sendText(from, '❗ Utilisation : .antilink on/off');
+    if (!groupSettings[from]) groupSettings[from] = {};
+    groupSettings[from].antilink = (state === 'on');
+    await saveSettings();
+    sendText(from, `✅ Anti‑lien ${state === 'on' ? 'activé' : 'désactivé'}.`);
+};
+
+commands.antibadword = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const state = args[0]?.toLowerCase();
+    if (state !== 'on' && state !== 'off') return sendText(from, '❗ Utilisation : .antibadword on/off');
+    if (!groupSettings[from]) groupSettings[from] = {};
+    groupSettings[from].antibadword = (state === 'on');
+    await saveSettings();
+    sendText(from, `✅ Anti‑mots ${state === 'on' ? 'activé' : 'désactivé'}.`);
+};
+
+commands.antispam = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const state = args[0]?.toLowerCase();
+    if (state !== 'on' && state !== 'off') return sendText(from, '❗ Utilisation : .antispam on/off');
+    if (!groupSettings[from]) groupSettings[from] = {};
+    groupSettings[from].antispam = (state === 'on');
+    await saveSettings();
+    sendText(from, `✅ Anti‑spam ${state === 'on' ? 'activé' : 'désactivé'}.`);
+};
+
+commands.antitag = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const state = args[0]?.toLowerCase();
+    if (state !== 'on' && state !== 'off') return sendText(from, '❗ Utilisation : .antitag on/off');
+    if (!groupSettings[from]) groupSettings[from] = {};
+    groupSettings[from].antitag = (state === 'on');
+    await saveSettings();
+    sendText(from, `✅ Anti‑mention ${state === 'on' ? 'activé' : 'désactivé'}.`);
+};
+
+commands.antibot = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const state = args[0]?.toLowerCase();
+    if (state !== 'on' && state !== 'off') return sendText(from, '❗ Utilisation : .antibot on/off');
+    if (!groupSettings[from]) groupSettings[from] = {};
+    groupSettings[from].antibot = (state === 'on');
+    await saveSettings();
+    sendText(from, `✅ Anti‑bot ${state === 'on' ? 'activé' : 'désactivé'}.`);
+};
+
+commands.del = async (msg, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+    if (!quoted) return sendText(from, '❗ Répondez au message.');
+    try {
+        const key = msg.message.extendedTextMessage.contextInfo.stanzaId;
+        await sock.sendMessage(from, { delete: { remoteJid: from, fromMe: false, id: key, participant: msg.message.extendedTextMessage.contextInfo.participant } });
+        sendText(from, '✅ Message supprimé.');
+    } catch (e) {
+        sendText(from, `❌ Erreur : ${e.message}`);
+    }
+};
+
+commands.purge = async (msg, args, from, sender) => {
+    if (!await isAdmin(from, sender)) return sendText(from, '❌ Admin requis.');
+    sendText(from, `⚠️ Purge non implémentée.`);
+};
+
+// -------- FUN --------
+commands.blague = async (msg, args, from, sender) => {
+    if (process.env.BLAGUE_API_KEY) {
+        try {
+            const res = await axios.get('https://api.blagues-api.fr/random', { headers: { 'Authorization': 'Bearer ' + process.env.BLAGUE_API_KEY } });
+            sendText(from, `😂 ${res.data.joke}\n${res.data.answer}`);
+            return;
+        } catch (e) {}
+    }
+    sendText(from, `😆 Pourquoi les plongeurs plongent-ils toujours en arrière ? Parce que sinon ils tombent dans le bateau.`);
+};
+
+commands.fact = async (msg, args, from, sender) => {
+    try {
+        const res = await axios.get('https://uselessfacts.jsph.pl/random.json?language=fr');
+        sendText(from, `🔍 ${res.data.text}`);
+    } catch (e) {
+        sendText(from, `🔍 Les fourmis ne dorment jamais.`);
+    }
+};
+
+commands.meme = async (msg, args, from, sender) => {
+    try {
+        const res = await axios.get('https://meme-api.com/gimme');
+        const meme = res.data;
+        await sock.sendMessage(from, { image: { url: meme.url }, caption: `😄 ${meme.title}` });
+    } catch (e) {
+        sendText(from, `😄 Désolé, pas de mème.`);
+    }
+};
+
+commands.quote = async (msg, args, from, sender) => {
+    try {
+        const res = await axios.get('https://api.quotable.io/random');
+        sendText(from, `💬 "${res.data.content}" — ${res.data.author}`);
+    } catch (e) {
+        sendText(from, `💬 "La vie est un mystère qu'il faut vivre."`);
+    }
+};
+
+commands.gif = async (msg, args, from, sender) => {
+    const query = args.join(' ');
+    if (!query) return sendText(from, '❗ Mot-clé requis.');
+    if (!process.env.GIPHY_API_KEY) return sendText(from, '⚠️ Clé GIPHY manquante.');
+    try {
+        const res = await axios.get(`https://api.giphy.com/v1/gifs/translate?api_key=${process.env.GIPHY_API_KEY}&s=${encodeURIComponent(query)}`);
+        const url = res.data.data.images.original.url;
+        await sock.sendMessage(from, { gif: { url } });
+    } catch (e) {
+        sendText(from, `❌ GIF introuvable.`);
+    }
+};
+
+commands.ship = async (msg, args, from, sender) => {
+    if (args.length < 2) return sendText(from, '❗ Utilisation : .ship nom1 nom2');
+    const p1 = args[0], p2 = args[1];
+    const percent = Math.floor(Math.random() * 101);
+    sendText(from, `💕 ${p1} ❤️ ${p2} : ${percent}% de compatibilité !`);
+};
+
+commands.truth = async (msg, args, from, sender) => {
+    const truths = ['Quelle est votre plus grande peur ?', 'Avez-vous menti à un ami ?', 'Quel est votre secret ?'];
+    sendText(from, `🔮 ${truths[Math.floor(Math.random() * truths.length)]}`);
+};
+
+commands.dare = async (msg, args, from, sender) => {
+    const dares = ['Faites 10 pompes.', 'Chantez une chanson.', 'Imitez un animal.'];
+    sendText(from, `🔥 ${dares[Math.floor(Math.random() * dares.length)]}`);
+};
+
+commands.compliment = async (msg, args, from, sender) => {
+    const compliments = ['Tu es génial(e) !', 'Tu illumines la pièce.', 'Tu as un sourire magnifique.'];
+    const target = args[0] || 'toi';
+    sendText(from, `💖 ${target} : ${compliments[Math.floor(Math.random() * compliments.length)]}`);
+};
+
+commands.goodnight = async (msg, args, from, sender) => {
+    sendText(from, `🌙 Bonne nuit, fais de beaux rêves !`);
+};
+
+commands.roseday = async (msg, args, from, sender) => {
+    sendText(from, `🌹 Joyeuse Journée de la Rose !`);
+};
+
+commands.valentine = async (msg, args, from, sender) => {
+    sendText(from, `❤️ Joyeuse Saint-Valentin !`);
+};
+
+// -------- OWNER --------
+commands.ban = async (msg, args, from, sender) => {
+    if (!isOwner(sender)) return sendText(from, '❌ Seul le propriétaire.');
+    sendText(from, `⚠️ Ban non implémenté.`);
+};
+
+commands.unban = async (msg, args, from, sender) => {
+    if (!isOwner(sender)) return sendText(from, '❌ Seul le propri
